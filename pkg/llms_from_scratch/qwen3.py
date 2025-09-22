@@ -64,8 +64,8 @@ QWEN3_CONFIG_8B = {
     "context_length": 40_960,
     "emb_dim": 4096,                 # 60% larger than above
     "n_heads": 32,
-    "n_layers": 36,                  # 26% larger than above
-    "hidden_dim": 12288,
+    "n_layers": 36,
+    "hidden_dim": 12288,             # 26% larger than above
     "head_dim": 128,
     "qk_norm": True,
     "n_kv_groups": 8,
@@ -316,6 +316,58 @@ class GroupedQueryAttention(nn.Module):
         return self.out_proj(context)
 
 
+# ==============================================================================
+# RoPE implementation summary
+#
+#
+# There are two common styles to implement RoPE, which are
+# mathematically equivalent;
+# they mainly differ in how the rotation matrix pairs dimensions.
+#
+# 1) Split-halves style (this repo, Hugging Face Transformers):
+#
+#   For hidden dim d = 8 (example):
+#
+#       [ x0   x1   x2   x3   x4   x5   x6   x7 ]
+#         │    │    │    │    │    │    │    │
+#         ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
+#        cos  cos  cos  cos  sin  sin  sin  sin
+#
+#   Rotation matrix:
+#
+#       [ cosθ   -sinθ    0      0   ... ]
+#       [ sinθ    cosθ    0      0   ... ]
+#       [  0       0    cosθ   -sinθ ... ]
+#       [  0       0    sinθ    cosθ ... ]
+#        ...
+#
+#   Here, the embedding dims are split into two halves and then
+#   each one is rotated in blocks.
+#
+#
+# 2) Interleaved (even/odd) style (original paper, Llama repo):
+#
+#   For hidden dim d = 8 (example):
+#
+#       [ x0   x1   x2   x3   x4   x5   x6   x7 ]
+#         │    │    │    │    │    │    │    │
+#         ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
+#        cos  sin  cos  sin  cos  sin  cos  sin
+#
+#   Rotation matrix:
+#       [ cosθ  -sinθ    0      0   ... ]
+#       [ sinθ   cosθ    0      0   ... ]
+#       [  0      0    cosθ   -sinθ ... ]
+#       [  0      0    sinθ    cosθ ... ]
+#        ...
+#
+#   Here, embedding dims are interleaved as even/odd cosine/sine pairs.
+#
+# Both layouts encode the same relative positions; the only difference is how
+# dimensions are paired.
+# ==============================================================================
+
+
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
     assert head_dim % 2 == 0, "Embedding dimension must be even"
 
@@ -326,7 +378,7 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=
     positions = torch.arange(context_length, dtype=dtype)
 
     # Compute the angles
-    angles = positions[:, None] * inv_freq[None, :]  # Shape: (context_length, head_dim // 2)
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0) # Shape: (context_length, head_dim // 2)
 
     # Expand angles to match the head_dim
     angles = torch.cat([angles, angles], dim=1)  # Shape: (context_length, head_dim)
@@ -387,7 +439,14 @@ def load_weights_into_qwen(model, param_config, params):
     def assign(left, right, tensor_name="unknown"):
         if left.shape != right.shape:
             raise ValueError(f"Shape mismatch in tensor '{tensor_name}'. Left: {left.shape}, Right: {right.shape}")
-        return torch.nn.Parameter(right.clone().detach() if isinstance(right, torch.Tensor) else torch.tensor(right))
+
+        with torch.no_grad():
+            if isinstance(right, torch.Tensor):
+                left.copy_(right)
+            else:
+                left.copy_(torch.as_tensor(right, dtype=left.dtype, device=left.device))
+
+        return left
 
     model.tok_emb.weight = assign(model.tok_emb.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
 
@@ -500,9 +559,8 @@ def load_weights_into_qwen(model, param_config, params):
     if "lm_head.weight" in params:
         model.out_head.weight = assign(model.out_head.weight, params["lm_head.weight"], "lm_head.weight")
     else:
-        # Model uses weight tying, hence we reuse the embedding layer weights here
+        model.out_head.weight = model.tok_emb.weight
         print("Model uses weight tying.")
-        model.out_head.weight = assign(model.out_head.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
 
 
 class Qwen3Tokenizer:
@@ -514,8 +572,9 @@ class Qwen3Tokenizer:
         "<|quad_start|>", "<|quad_end|>",
         "<|vision_start|>", "<|vision_end|>",
         "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
+        "<think>", "</think>"
     ]
-    _SPLIT_RE = re.compile(r"(<\|[^>]+?\|>)")
+    _SPLIT_RE = re.compile(r"(<\|[^>]+?\|>|<think>|</think>)")
 
     def __init__(self, tokenizer_file_path="tokenizer.json", repo_id=None,
                  apply_chat_template=True, add_generation_prompt=False, add_thinking=False):
@@ -533,9 +592,13 @@ class Qwen3Tokenizer:
                 local_dir=str(tok_file.parent),
             )
         self._tok = Tokenizer.from_file(str(tok_file))
-        self._special_to_id = {t: self._tok.token_to_id(t) for t in self._SPECIALS}
+        self._special_to_id = {}
+        for t in self._SPECIALS:
+            tid = self._tok.token_to_id(t)
+            if tid is not None:
+                self._special_to_id[t] = tid
 
-        self.pad_token_id = self._special_to_id.get("<|endoftext|>")
+        self.pad_token_id = self._special_to_id["<|endoftext|>"]
         self.eos_token_id = self.pad_token_id
 
         if repo_id and "Base" not in repo_id:
